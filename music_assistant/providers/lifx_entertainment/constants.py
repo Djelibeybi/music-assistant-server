@@ -6,6 +6,8 @@ from typing import Final
 
 from music_assistant.providers.sendspin_lights.analyzer import COLOR_MODES as ANALYZER_COLOR_MODES
 
+from .effects import Effect
+
 CONF_BROADCAST: Final[str] = "broadcast_address"
 CONF_EXTRA_HOSTS: Final[str] = "extra_hosts"
 CONF_DEVICES: Final[str] = "devices"
@@ -17,8 +19,9 @@ CONF_LIGHT_LATENCY_MS: Final[str] = "light_latency_ms"
 CONF_TRANSITION_MS: Final[str] = "transition_ms"
 CONF_POWER_ON: Final[str] = "power_on"
 
-# First entry is the default.
-COLOR_MODES: Final[tuple[str, ...]] = ANALYZER_COLOR_MODES
+# First entry is the default. The analyzer modes colour the channels; the effect modes
+# render pixel effects onto strips and matrices.
+COLOR_MODES: Final[tuple[str, ...]] = ANALYZER_COLOR_MODES + tuple(e.value for e in Effect)
 DEFAULT_COLOR_MODE: Final[str] = COLOR_MODES[0]
 
 GROUPINGS: Final[tuple[str, ...]] = ("group", "all", "light")

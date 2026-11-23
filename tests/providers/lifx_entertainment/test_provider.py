@@ -24,6 +24,7 @@ from aiosendspin.noise.keys import Identity
 from aiosendspin.noise.trust_store import InMemoryServerPairingStore
 from aiosendspin.server import SendspinServer
 from aiosendspin.server.roles.base import AudioChunk
+from lifx.effects import DeviceStateManager
 from lifx.protocol import packets
 from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
 from music_assistant_models.enums import FlowStepType, PlayerType, ProviderType
@@ -37,6 +38,7 @@ from music_assistant.providers.lifx_entertainment import bridge as bridge_module
 from music_assistant.providers.lifx_entertainment import lights as lights_module
 from music_assistant.providers.lifx_entertainment import provider as provider_module
 from music_assistant.providers.lifx_entertainment import setup_flow
+from music_assistant.providers.lifx_entertainment.areas import build_areas
 from music_assistant.providers.lifx_entertainment.constants import (
     CONF_BRIGHTNESS,
     CONF_BROADCAST,
@@ -55,6 +57,8 @@ from music_assistant.providers.lifx_entertainment.models import (
     ZoneSupport,
 )
 from music_assistant.providers.lifx_entertainment.provider import LifxEntertainmentProvider
+from music_assistant.providers.lifx_entertainment.session import EntertainmentSession
+from music_assistant.providers.sendspin_lights.models import LightColor
 from tests.providers.lifx_entertainment.fakes import LEGACY_FIRMWARE, FakeLifxDevice, Hsbk
 
 _PROVIDER_DIR = Path(provider_module.__file__).parent
@@ -260,6 +264,55 @@ async def test_provider_streams_music_to_the_lights(
     finally:
         await provider.unload()
     assert not [c for c in sendspin_server.clients if c.client_id.startswith("lifx-")]
+
+
+async def test_effect_mode_renders_pixel_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    sendspin_server: SendspinServer,
+    bulb: FakeLifxDevice,
+    strip: FakeLifxDevice,
+) -> None:
+    """In waveform mode the strip spreads red to blue and the bulb shows white."""
+    monkeypatch.setattr(bridge_module, "_STOP_DEBOUNCE_S", 0.1)
+    monkeypatch.setattr(provider_module, "DISCOVERY_TIMEOUT_S", 0.3)
+    setup_data = {
+        CONF_BROADCAST: "127.0.0.1",
+        CONF_GROUPING: "all",
+        CONF_DEVICES: json.dumps(
+            [
+                _stored(bulb),
+                _stored(strip, zone_support=ZoneSupport.EXTENDED, zone_count=16),
+            ]
+        ),
+    }
+    mass = _make_mass(sendspin_server, setup_data)
+    config = await _make_config(setup_data)
+    config.update({CONF_COLOR_MODE: "waveform"})
+    provider = LifxEntertainmentProvider(mass, _manifest(), config, set())
+
+    await provider.handle_async_init()
+    try:
+        client = next(c for c in sendspin_server.clients if c.client_id.startswith("lifx-"))
+        viz_role = client.roles_by_family("visualizer")[0]
+        viz_role.on_stream_start()
+        await _wait_for(lambda: bulb.power == 65535)
+
+        now = sendspin_server.clock.now_us()
+        for chunk in _music(now, 3.0):
+            viz_role.on_audio_chunk(chunk)
+        await _wait_for(lambda: len(strip.of_type(packets.MultiZone.SetExtendedColorZones)) >= 5)
+
+        hues = [z.hue for z in strip.zones]
+        assert hues[0] < hues[len(hues) // 2] < hues[-1]
+        # the waveform's treble end is blue (240 degrees)
+        assert abs(hues[-1] - 240 * 65535 // 360) < 512
+        assert all(c.saturation == 0 for c in _bulb_colors(bulb)[-3:])
+        assert len({c.brightness for c in _bulb_colors(bulb)}) > 1
+
+        viz_role.on_stream_end()
+        await _wait_for(lambda: bulb.power == 0)
+    finally:
+        await provider.unload()
 
 
 def _bulb_colors(bulb: FakeLifxDevice) -> list[Hsbk]:
@@ -616,14 +669,6 @@ async def test_setup_fails_with_only_a_legacy_strip(sendspin_server: SendspinSer
 
 async def test_session_leaves_a_thread_light_alone(bulb: FakeLifxDevice) -> None:
     """A Thread light in an area is refused at session start and never touched."""
-    from lifx.effects import DeviceStateManager  # noqa: PLC0415
-
-    from music_assistant.providers.lifx_entertainment.areas import build_areas  # noqa: PLC0415
-    from music_assistant.providers.lifx_entertainment.session import (  # noqa: PLC0415
-        EntertainmentSession,
-    )
-    from music_assistant.providers.sendspin_lights.models import LightColor  # noqa: PLC0415
-
     thread = FakeLifxDevice("d073d5dddddd", "Thread bulb", power=0, thread=True)
     await thread.start()
     pool = lights_module.LightPool()

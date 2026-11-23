@@ -34,7 +34,16 @@
     },
     "color_mode": {
       "label": "Mode",
-      "description": "Visualization style. Smooth (default): spectrum-driven brightness with a slowly drifting palette. Ambient: colour cycling only, no brightness modulation. Flashing: brightness pulse on every beat, stronger on downbeats. Energetic: large brightness swings on hits plus fast palette rotation."
+      "description": "Visualization style. Smooth (default): spectrum-driven brightness with a slowly drifting palette. Ambient: colour cycling only, no brightness modulation. Flashing: brightness pulse on every beat, stronger on downbeats. Energetic: large brightness swings on hits plus fast palette rotation. The remaining modes are pixel effects for strips and matrices. Sound level: white light that follows the loudness and flashes on beats. Waveform: the spectrum across the light, bass to treble, red to blue. Spectrum: spectrum bars with peak markers on a matrix, or bar brightness along a strip. A bulb shows sound level in the effect modes.",
+      "options": {
+        "smooth": "Smooth",
+        "ambient": "Ambient",
+        "flashing": "Flashing",
+        "energetic": "Energetic",
+        "sound_level": "Sound level",
+        "waveform": "Waveform",
+        "spectrum": "Spectrum"
+      }
     },
     "light_latency_ms": {
       "label": "Light latency (ms)",

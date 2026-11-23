@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any
 
 from lifx.const import LIFX_UDP_PORT
+from lifx.products import get_registry
 
 
 class ZoneSupport(StrEnum):
@@ -36,6 +37,12 @@ class LifxDevice:
     def is_multizone(self) -> bool:
         """Return True when the light has individually addressable zones."""
         return self.zone_support != ZoneSupport.NONE and self.zone_count > 1
+
+    @property
+    def is_matrix(self) -> bool:
+        """Return True when the light is a pixel matrix (Tile, Candle, Ceiling, ...)."""
+        product = get_registry().get_product(self.product_id)
+        return product is not None and product.has_matrix
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain dict for the setup data."""
@@ -77,7 +84,8 @@ class LightChannel:
     A single light channel of an entertainment area.
 
     A plain bulb is one channel; a multizone strip is split into several channels, each
-    driving a contiguous range of zones ``[zone_start, zone_end)``.
+    driving a contiguous range of zones ``[zone_start, zone_end)``; a matrix is split into
+    a grid of channels, each driving one cell ``(column, row)`` of the grid, row 0 at the top.
     """
 
     channel_id: int
@@ -86,6 +94,8 @@ class LightChannel:
     position: tuple[float, float, float] = (0.0, 0.0, 0.0)
     zone_start: int = 0
     zone_end: int = 1
+    column: int = 0
+    row: int = 0
 
 
 @dataclass

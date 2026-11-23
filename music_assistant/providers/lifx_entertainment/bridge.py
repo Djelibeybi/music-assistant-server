@@ -15,11 +15,14 @@ from music_assistant.providers.sendspin_lights.base import SendspinLightBridge
 
 from .areas import area_client_id
 from .constants import (
+    DEFAULT_COLOR_MODE,
     SPECTRUM_BINS,
     SPECTRUM_F_MAX,
     SPECTRUM_F_MIN,
     SPECTRUM_SCALE,
 )
+from .effects import Effect
+from .features import FeatureTracker
 from .session import EntertainmentSession
 from .settings import (
     get_brightness,
@@ -82,7 +85,8 @@ class LifxEntertainmentBridge(SendspinLightBridge):
             visualizer_request=VisualizerStatePayload(
                 rate_max=_VISUALIZER_RATE_HZ,
                 # Peaks drive the lights until the beat schedule has been computed.
-                types=["beat", "peak", "spectrum"],
+                # Loudness drives the pixel effects.
+                types=["beat", "peak", "spectrum", "loudness"],
                 spectrum=ClientHelloVisualizerSpectrum(
                     n_disp_bins=SPECTRUM_BINS,
                     scale=SPECTRUM_SCALE,
@@ -96,11 +100,15 @@ class LifxEntertainmentBridge(SendspinLightBridge):
         )
         self.lifx_provider = provider
         self.area = area
+        color_mode = get_color_mode(provider.config)
+        self._effect = _effect_for(color_mode)
+        self._brightness = get_brightness(provider.config)
         self._analyzer = AudioAnalyzer(
             channels=area.channels,
-            color_mode=get_color_mode(provider.config),
-            brightness=get_brightness(provider.config),
+            color_mode=_analyzer_mode(color_mode),
+            brightness=self._brightness,
         )
+        self._features = FeatureTracker()
         self._session: EntertainmentSession | None = None
         self._session_starting = False
         # Serializes session start and stop, so a new session only snapshots the lights
@@ -142,7 +150,20 @@ class LifxEntertainmentBridge(SendspinLightBridge):
         power_on: bool | None = None,
     ) -> None:
         """Update analyzer/bridge settings without restarting the bridge."""
-        self._analyzer.update_settings(color_mode=color_mode, brightness=brightness)
+        self._analyzer.update_settings(
+            color_mode=None if color_mode is None else _analyzer_mode(color_mode),
+            brightness=brightness,
+        )
+        if color_mode is not None:
+            self._effect = _effect_for(color_mode)
+            if self._effect is None:
+                self._features.clear()
+            if self._session is not None:
+                self._session.effect = self._effect
+        if brightness is not None:
+            self._brightness = brightness
+            if self._session is not None:
+                self._session.brightness = brightness
         if light_latency_ms is not None:
             self._latency_us = light_latency_ms * 1000
         if transition_ms is not None:
@@ -172,6 +193,8 @@ class LifxEntertainmentBridge(SendspinLightBridge):
             self.area,
             transition_ms=self._transition_ms,
             power_on=self._power_on,
+            effect=self._effect,
+            brightness=self._brightness,
         )
         # Until adopted, the finally closes the session so a failed or cancelled start
         # never leaves the lights half switched on.
@@ -210,6 +233,7 @@ class LifxEntertainmentBridge(SendspinLightBridge):
         self._is_streaming = False
         self._cancel_render_loop()
         self._analyzer.clear_beats()
+        self._features.clear()
         async with self._session_lock:
             session, self._session = self._session, None
             if session is not None:
@@ -240,6 +264,7 @@ class LifxEntertainmentBridge(SendspinLightBridge):
     def _on_stream_clear(self) -> None:
         """Drop analyzer state queued before a seek."""
         self._analyzer.clear_beats()
+        self._features.clear()
 
     async def _debounced_stop(self) -> None:
         """Stop after a short delay, unless a new stream started meanwhile."""
@@ -255,6 +280,8 @@ class LifxEntertainmentBridge(SendspinLightBridge):
         # Frames arrive ahead of the playhead; the analyzer queues them by timestamp.
         if not (self._is_streaming or self._session_starting):
             return
+        if self._effect is not None:
+            self._features.push(frame)
         if frame.spectrum is not None:
             self._analyzer.apply_spectrum(frame.spectrum.tolist(), frame.timestamp_us)
         if frame.peak is not None:
@@ -288,7 +315,11 @@ class LifxEntertainmentBridge(SendspinLightBridge):
         if session is None or not session.is_streaming:
             return
         # Render ahead of the playhead to compensate for Wi-Fi + bulb lag.
-        colors = self._analyzer.render(self.sendspin_server.clock.now_us() + self._latency_us)
+        playhead_us = self.sendspin_server.clock.now_us() + self._latency_us
+        if self._effect is not None:
+            session.send_effect(self._features.advance(playhead_us))
+            return
+        colors = self._analyzer.render(playhead_us)
         if colors:
             session.send(colors)
 
@@ -364,3 +395,16 @@ class LifxEntertainmentBridgeManager:
             with suppress(Exception):
                 await bridge.stop()
         self._bridges.clear()
+
+
+def _effect_for(color_mode: str) -> Effect | None:
+    """Return the pixel effect a colour mode selects, or None for an analyzer mode."""
+    try:
+        return Effect(color_mode)
+    except ValueError:
+        return None
+
+
+def _analyzer_mode(color_mode: str) -> str:
+    """Return the analyzer mode for a colour mode; the effect modes leave it at the default."""
+    return DEFAULT_COLOR_MODE if _effect_for(color_mode) is not None else color_mode

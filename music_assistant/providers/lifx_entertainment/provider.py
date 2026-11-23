@@ -107,7 +107,10 @@ class LifxEntertainmentProvider(PluginProvider):
                 key=CONF_COLOR_MODE,
                 type=ConfigEntryType.STRING,
                 default_value=DEFAULT_COLOR_MODE,
-                options=[ConfigValueOption(mode, title=mode.capitalize()) for mode in COLOR_MODES],
+                options=[
+                    ConfigValueOption(mode, title=mode.replace("_", " ").capitalize())
+                    for mode in COLOR_MODES
+                ],
                 category="settings",
             ),
             ConfigEntry(

@@ -8,6 +8,7 @@ stay stable across releases.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from enum import StrEnum
 
 from .models import EntertainmentArea, LifxDevice, LightChannel
@@ -15,6 +16,9 @@ from .models import EntertainmentArea, LifxDevice, LightChannel
 # A multizone strip is split into at most this many channels, so the analyzer's
 # per-channel spectrum bands stay musically meaningful on long strips.
 DEFAULT_MAX_SEGMENTS = 8
+# A matrix is split into this many (columns, rows) of channels for the analyzer, whatever
+# its size: enough to make it multicoloured without crowding the analyzer's filters.
+MATRIX_GRID = (3, 3)
 
 
 class Grouping(StrEnum):
@@ -76,32 +80,51 @@ def build_channels(
     :param devices: The lights of one area, in display order.
     :param max_segments: Maximum number of channels a multizone strip is split into.
     """
-    specs: list[tuple[LifxDevice, int, int, str]] = []
+    # One slot per position along the x axis; a matrix fills a slot per grid column,
+    # with its rows stacked on the z axis so the analyzer gives them their own bands.
+    slots: list[list[_Spec]] = []
     for device in devices:
         name = device.label or device.serial
-        if not device.is_multizone:
-            specs.append((device, 0, 1, name))
-            continue
-        segments = max(1, min(max_segments, device.zone_count))
-        for segment in range(segments):
-            start = segment * device.zone_count // segments
-            end = (segment + 1) * device.zone_count // segments
-            specs.append((device, start, end, f"{name} #{segment + 1}"))
-    count = len(specs)
+        if device.is_matrix:
+            columns, rows = MATRIX_GRID
+            for column in range(columns):
+                slots.append(
+                    [
+                        _Spec(
+                            device,
+                            name=f"{name} #{row * columns + column + 1}",
+                            column=column,
+                            row=row,
+                        )
+                        for row in range(rows)
+                    ]
+                )
+        elif device.is_multizone:
+            segments = max(1, min(max_segments, device.zone_count))
+            for segment in range(segments):
+                start = segment * device.zone_count // segments
+                end = (segment + 1) * device.zone_count // segments
+                slots.append([_Spec(device, name=f"{name} #{segment + 1}", start=start, end=end)])
+        else:
+            slots.append([_Spec(device, name=name)])
+    count = len(slots)
     channels: list[LightChannel] = []
     # Positions along the x axis give the analyzer a spatial axis for its colour gradient.
-    for index, (device, start, end, name) in enumerate(specs):
+    for index, slot in enumerate(slots):
         x = 0.0 if count == 1 else -1.0 + 2.0 * index / (count - 1)
-        channels.append(
-            LightChannel(
-                channel_id=index,
-                service_id=device.serial,
-                name=name,
-                position=(x, 0.0, 0.0),
-                zone_start=start,
-                zone_end=end,
+        for spec in slot:
+            channels.append(
+                LightChannel(
+                    channel_id=len(channels),
+                    service_id=spec.device.serial,
+                    name=spec.name,
+                    position=(x, 0.0, spec.z),
+                    zone_start=spec.start,
+                    zone_end=spec.end,
+                    column=spec.column,
+                    row=spec.row,
+                )
             )
-        )
     return channels
 
 
@@ -113,3 +136,23 @@ def area_client_id(area_id: str, namespace: str = "") -> str:
     :param namespace: Keeps the ids of several provider instances apart.
     """
     return hashlib.sha1(f"{namespace}:{area_id}".encode(), usedforsecurity=False).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class _Spec:
+    """One channel to create, before its position along the x axis is known."""
+
+    device: LifxDevice
+    name: str
+    start: int = 0
+    end: int = 1
+    column: int = 0
+    row: int = 0
+
+    @property
+    def z(self) -> float:
+        """Height of a matrix row in [-1, 1], top row highest; 0 for other lights."""
+        rows = MATRIX_GRID[1]
+        if not self.device.is_matrix or rows < 2:
+            return 0.0
+        return 1.0 - 2.0 * self.row / (rows - 1)

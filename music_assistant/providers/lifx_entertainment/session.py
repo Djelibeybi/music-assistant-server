@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 
 from lifx import HSBK, LifxError
 
+from .areas import MATRIX_GRID
+from .effects import HSBK_MAX, create_effect
 from .lights import DEFAULT_KELVIN, rgb16_to_hsbk
 from .models import ZoneSupport
 
@@ -21,8 +23,9 @@ if TYPE_CHECKING:
 
     from music_assistant.providers.sendspin_lights.models import LightColor
 
+    from .effects import AudioEffect, AudioFeatures, Effect
     from .lights import LightPool
-    from .models import EntertainmentArea, LifxDevice
+    from .models import EntertainmentArea, LifxDevice, LightChannel
 
 LOGGER = logging.getLogger(__name__)
 
@@ -31,7 +34,8 @@ DEFAULT_TRANSITION_MS = 50
 # never leaves a light stuck on a stale colour.
 _KEEPALIVE_S = 1.0
 
-_Frame = list[tuple[int, int, int, int]]
+_Pixel = tuple[int, int, int, int]
+_Frame = list[_Pixel]
 
 
 class EntertainmentSession:
@@ -50,6 +54,8 @@ class EntertainmentSession:
         transition_ms: int = DEFAULT_TRANSITION_MS,
         power_on: bool = True,
         kelvin: int = DEFAULT_KELVIN,
+        effect: Effect | None = None,
+        brightness: int = 100,
     ) -> None:
         """
         Initialize the session (no network I/O until :meth:`start`).
@@ -60,6 +66,8 @@ class EntertainmentSession:
         :param transition_ms: Fade time of each frame; smooths over frame jitter.
         :param power_on: Switch on lights that are off when the session starts.
         :param kelvin: White point for low-saturation colours.
+        :param effect: The pixel effect to render, or None when the analyzer drives the lights.
+        :param brightness: Brightness of the effect, in percent.
         """
         self._pool = pool
         self._state_manager = state_manager
@@ -73,6 +81,11 @@ class EntertainmentSession:
         self._snapshots: dict[str, PreState] = {}
         self._animators: dict[str, Animator] = {}
         self._zone_frames: dict[str, _Frame] = {}
+        self._cell_colors: dict[str, dict[tuple[int, int], _Pixel]] = {}
+        self._effect = effect
+        self._effects: dict[str, AudioEffect] = {}
+        self._effect_started = time.monotonic()
+        self.brightness = brightness
         self._last_frame: dict[str, _Frame] = {}
         self._last_sent: dict[str, float] = {}
         self._streaming = False
@@ -94,6 +107,19 @@ class EntertainmentSession:
         self._transition_ms = value
         for animator in self._animators.values():
             animator.duration_ms = value
+
+    @property
+    def effect(self) -> Effect | None:
+        """Return the pixel effect being rendered, or None when the analyzer drives the lights."""
+        return self._effect
+
+    @effect.setter
+    def effect(self, value: Effect | None) -> None:
+        """Switch the pixel effect, also while streaming."""
+        if value != self._effect:
+            self._effect = value
+            self._effects.clear()
+            self._effect_started = time.monotonic()
 
     async def start(self) -> None:
         """
@@ -121,6 +147,9 @@ class EntertainmentSession:
                 raise ConnectionError(msg)
             self._last_frame.clear()
             self._last_sent.clear()
+            self._cell_colors.clear()
+            self._effects.clear()
+            self._effect_started = time.monotonic()
             self._zone_frames = {
                 serial: [(0, 0, 0, self._kelvin)] * animator.pixel_count
                 for serial, animator in self._animators.items()
@@ -144,19 +173,41 @@ class EntertainmentSession:
         """
         if not self._streaming:
             return
-        per_device: dict[str, list[tuple[int, int, tuple[int, int, int, int]]]] = {}
+        per_device: dict[str, list[tuple[LightChannel, _Pixel]]] = {}
         for color in colors:
             channel = self._channels.get(color.channel_id)
             if channel is None or channel.service_id not in self._animators:
                 continue
             hsbk = rgb16_to_hsbk(color.red, color.green, color.blue, self._kelvin)
-            per_device.setdefault(channel.service_id, []).append(
-                (channel.zone_start, channel.zone_end, hsbk)
-            )
+            per_device.setdefault(channel.service_id, []).append((channel, hsbk))
         now = time.monotonic()
         for serial, updates in per_device.items():
             animator = self._animators[serial]
             frame = self._build_frame(self._devices[serial], animator, updates)
+            self._send_frame(serial, animator, frame, now)
+
+    def send_effect(self, audio: AudioFeatures) -> None:
+        """
+        Render the pixel effect for the audio at the playhead and push it to the lights.
+
+        Non-blocking and safe to call from the event loop; a no-op when not streaming or
+        when no effect is chosen.
+
+        :param audio: The audio at the playhead.
+        """
+        if not self._streaming or self._effect is None:
+            return
+        t = time.monotonic() - self._effect_started
+        scale = max(0, min(100, self.brightness)) / 100
+        now = time.monotonic()
+        for serial, animator in self._animators.items():
+            width, height = animator.canvas_width, animator.canvas_height
+            effect = self._effects.get(serial)
+            if effect is None:
+                effect = self._effects[serial] = create_effect(self._effect, width, height)
+            frame = effect.render(t, audio, width, height)
+            if scale < 1:
+                frame = [(h, s, min(HSBK_MAX, int(b * scale)), k) for h, s, b, k in frame]
             self._send_frame(serial, animator, frame, now)
 
     async def aclose(self) -> None:
@@ -212,20 +263,41 @@ class EntertainmentSession:
         self,
         device: LifxDevice,
         animator: Animator,
-        updates: list[tuple[int, int, tuple[int, int, int, int]]],
+        updates: list[tuple[LightChannel, _Pixel]],
     ) -> _Frame:
+        if device.is_matrix:
+            return self._matrix_frame(device, animator, updates)
         if not device.is_multizone:
-            # A bulb, tile or ceiling light has a single channel and shows one colour;
-            # if several channels map to it, average them.
-            color = updates[0][2] if len(updates) == 1 else _average([u[2] for u in updates])
+            # A bulb has a single channel and shows one colour; if several channels map
+            # to it, average them.
+            color = updates[0][1] if len(updates) == 1 else _average([u[1] for u in updates])
             return [color] * animator.pixel_count
         zones = self._zone_frames.setdefault(
             device.serial, [(0, 0, 0, self._kelvin)] * animator.pixel_count
         )
-        for start, end, color in updates:
-            for index in range(max(0, start), min(len(zones), end)):
+        for channel, color in updates:
+            for index in range(max(0, channel.zone_start), min(len(zones), channel.zone_end)):
                 zones[index] = color
         return list(zones)
+
+    def _matrix_frame(
+        self,
+        device: LifxDevice,
+        animator: Animator,
+        updates: list[tuple[LightChannel, _Pixel]],
+    ) -> _Frame:
+        """Paint each cell of the channel grid over its block of the matrix's pixels."""
+        cells = self._cell_colors.setdefault(device.serial, {})
+        for channel, color in updates:
+            cells[(channel.column, channel.row)] = color
+        columns, rows = MATRIX_GRID
+        width, height = animator.canvas_width, animator.canvas_height
+        dark: _Pixel = (0, 0, 0, self._kelvin)
+        row_cells = [
+            [cells.get((x * columns // width, y * rows // height), dark) for x in range(width)]
+            for y in range(height)
+        ]
+        return [pixel for row in row_cells for pixel in row]
 
     def _send_frame(self, serial: str, animator: Animator, frame: _Frame, now: float) -> None:
         unchanged = self._last_frame.get(serial) == frame
@@ -243,7 +315,7 @@ class EntertainmentSession:
         self._last_sent[serial] = now
 
 
-def _average(colors: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
+def _average(colors: list[_Pixel]) -> _Pixel:
     """Average colours component-wise (only used when several channels share one light)."""
     count = len(colors)
     return (
