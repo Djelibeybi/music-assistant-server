@@ -9,11 +9,15 @@
     },
     "extra_hosts": {
       "label": "Additional light IP addresses",
-      "description": "Optional comma separated IP addresses of LIFX lights to probe directly, for networks that block broadcasts."
+      "description": "Optional comma separated IPv4 or IPv6 addresses of LIFX lights to probe directly, for networks that block broadcasts."
     },
     "lights": {
       "label": "Lights",
-      "description": "The LIFX lights that should react to music."
+      "description": "The LIFX lights that should react to music.",
+      "disabled_reasons": {
+        "legacy_multizone": "This strip's firmware has no extended multizone support, so it can't keep up with the music. Update its firmware in the LIFX app.",
+        "thread": "This light connects over Thread, which can't carry the steady stream of updates music sync needs."
+      }
     },
     "grouping": {
       "label": "Light players",
@@ -64,6 +68,7 @@
   },
   "errors": {
     "no_lights_found": "No LIFX lights were found. Check that they are powered and on the same network, or enter their IP addresses.",
-    "no_lights_selected": "Select at least one light."
+    "no_lights_selected": "Select at least one light.",
+    "invalid_address": "Enter valid IPv4 or IPv6 addresses."
   }
 }

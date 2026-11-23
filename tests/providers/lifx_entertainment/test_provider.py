@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -24,8 +24,7 @@ from aiosendspin.noise.keys import Identity
 from aiosendspin.noise.trust_store import InMemoryServerPairingStore
 from aiosendspin.server import SendspinServer
 from aiosendspin.server.roles.base import AudioChunk
-from lifx_entertainment import LifxDevice, ZoneSupport, discover_devices
-from lifx_entertainment.constants import MessageType
+from lifx.protocol import packets
 from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
 from music_assistant_models.enums import FlowStepType, PlayerType, ProviderType
 from music_assistant_models.errors import SetupFailedError
@@ -35,6 +34,7 @@ from music_assistant.constants import CONF_LOG_LEVEL, DEFAULT_PROVIDER_CONFIG_EN
 from music_assistant.models.provider import Provider
 from music_assistant.models.setup_flow import SetupFlowContext, SetupSession
 from music_assistant.providers.lifx_entertainment import bridge as bridge_module
+from music_assistant.providers.lifx_entertainment import lights as lights_module
 from music_assistant.providers.lifx_entertainment import provider as provider_module
 from music_assistant.providers.lifx_entertainment import setup_flow
 from music_assistant.providers.lifx_entertainment.constants import (
@@ -42,13 +42,20 @@ from music_assistant.providers.lifx_entertainment.constants import (
     CONF_BROADCAST,
     CONF_COLOR_MODE,
     CONF_DEVICES,
+    CONF_EXTRA_HOSTS,
     CONF_GROUPING,
     CONF_LIGHT_LATENCY_MS,
     CONF_LIGHTS,
     CONF_TRANSITION_MS,
 )
+from music_assistant.providers.lifx_entertainment.models import (
+    EntertainmentArea,
+    LifxDevice,
+    LightChannel,
+    ZoneSupport,
+)
 from music_assistant.providers.lifx_entertainment.provider import LifxEntertainmentProvider
-from tests.providers.lifx_entertainment.fakes import FakeLifxDevice
+from tests.providers.lifx_entertainment.fakes import LEGACY_FIRMWARE, FakeLifxDevice, Hsbk
 
 _PROVIDER_DIR = Path(provider_module.__file__).parent
 _INSTANCE_ID = "lifx_entertainment--test"
@@ -237,8 +244,8 @@ async def test_provider_streams_music_to_the_lights(
             viz_role.on_audio_chunk(chunk)
         await asyncio.sleep(1.5)
 
-        frames = [h for h, _ in bulb.of_type(MessageType.LIGHT_SET_COLOR) if not h.ack_required]
-        zone_frames = strip.of_type(MessageType.SET_EXTENDED_COLOR_ZONES)
+        frames = bulb.of_type(packets.Light.SetColor)
+        zone_frames = strip.of_type(packets.MultiZone.SetExtendedColorZones)
         assert len(frames) >= 5
         assert len(zone_frames) >= 5
         # the music drives the lights: they are not stuck on one colour
@@ -248,27 +255,24 @@ async def test_provider_streams_music_to_the_lights(
         viz_role.on_stream_end()
         await _wait_for(lambda: bulb.power == 0)
         await _wait_for(lambda: strip.zones == original_zones)
-        assert bulb.color == original_bulb
+        # a light that was off gets its colour back once it reports off
+        await _wait_for(lambda: bulb.color == original_bulb)
     finally:
         await provider.unload()
     assert not [c for c in sendspin_server.clients if c.client_id.startswith("lifx-")]
 
 
-def _bulb_colors(bulb: FakeLifxDevice) -> list[Any]:
-    from lifx_entertainment import protocol  # noqa: PLC0415
-
-    return [
-        protocol.decode_hsbk(payload, 1)
-        for header, payload in bulb.of_type(MessageType.LIGHT_SET_COLOR)
-        if not header.ack_required
-    ]
+def _bulb_colors(bulb: FakeLifxDevice) -> list[Hsbk]:
+    return [Hsbk.of(packet.color) for _, packet in bulb.of_type(packets.Light.SetColor)]  # type: ignore[attr-defined]
 
 
 async def test_setup_flow_discovers_and_stores_lights(
     monkeypatch: pytest.MonkeyPatch, strip: FakeLifxDevice
 ) -> None:
     """Drive the setup flow through Music Assistant's real SetupSession."""
-    monkeypatch.setattr(setup_flow, "discover_devices", partial(discover_devices, port=strip.port))
+    monkeypatch.setattr(
+        setup_flow, "discover_lights", partial(lights_module.discover_lights, port=strip.port)
+    )
     finish = AsyncMock(return_value={"instance_id": _INSTANCE_ID})
     session = SetupSession(
         MagicMock(),
@@ -305,7 +309,7 @@ async def test_setup_flow_discovers_and_stores_lights(
 
 async def test_setup_flow_reports_no_lights(monkeypatch: pytest.MonkeyPatch) -> None:
     """An empty discovery loops back to the first form with an error."""
-    monkeypatch.setattr(setup_flow, "discover_devices", AsyncMock(return_value=[]))
+    monkeypatch.setattr(setup_flow, "discover_lights", AsyncMock(return_value=[]))
     session = SetupSession(
         MagicMock(),
         "flow-2",
@@ -424,8 +428,6 @@ async def test_restart_during_restoration_waits_for_it(monkeypatch: pytest.Monke
 
     It neither cuts the restoration short nor snapshots half-restored lights.
     """
-    from lifx_entertainment import EntertainmentArea, LightChannel  # noqa: PLC0415
-
     monkeypatch.setattr(bridge_module, "_STOP_DEBOUNCE_S", 0.01)
     monkeypatch.setattr(_FakeSession, "events", [], raising=False)
     monkeypatch.setattr(_FakeSession, "restore_started", asyncio.Event(), raising=False)
@@ -461,42 +463,6 @@ async def test_restart_during_restoration_waits_for_it(monkeypatch: pytest.Monke
     assert _FakeSession.events[5] == "1:start"
 
 
-class _FailingTransport:
-    """A LAN transport whose socket can not be opened."""
-
-    instances: ClassVar[list[_FailingTransport]] = []
-
-    def __init__(self) -> None:
-        """Track the instance."""
-        self.closed = False
-        self.instances.append(self)
-
-    async def open(self) -> None:
-        """Fail like a port already in use."""
-        raise OSError("address in use")
-
-    def close(self) -> None:
-        """Record the close."""
-        self.closed = True
-
-
-async def test_setup_fails_when_the_lan_socket_can_not_open(
-    monkeypatch: pytest.MonkeyPatch, sendspin_server: SendspinServer, bulb: FakeLifxDevice
-) -> None:
-    """A LAN failure is reported through setup, and the partial transport is closed."""
-    monkeypatch.setattr(provider_module, "LifxTransport", _FailingTransport)
-    setup_data = {CONF_DEVICES: json.dumps([_stored(bulb)])}
-    config = await _make_config(setup_data)
-    provider = LifxEntertainmentProvider(
-        _make_mass(sendspin_server, setup_data), _manifest(), config, set()
-    )
-
-    with pytest.raises(SetupFailedError):
-        await provider.handle_async_init()
-    assert _FailingTransport.instances[-1].closed
-    assert provider._transport is None
-
-
 async def test_setup_fails_without_lights(sendspin_server: SendspinServer) -> None:
     """A provider with no lights stored fails its setup instead of loading inactive."""
     config = await _make_config({})
@@ -506,3 +472,173 @@ async def test_setup_fails_without_lights(sendspin_server: SendspinServer) -> No
 
     with pytest.raises(SetupFailedError):
         await provider.handle_async_init()
+
+
+async def test_setup_flow_lists_lights_that_cannot_sync_as_disabled(
+    monkeypatch: pytest.MonkeyPatch, bulb: FakeLifxDevice
+) -> None:
+    """A legacy strip and a Thread light are shown greyed out and never stored."""
+    legacy = FakeLifxDevice("d073d5cccccc", "Old strip", zones=8, firmware=LEGACY_FIRMWARE)
+    thread = FakeLifxDevice("d073d5dddddd", "Thread bulb", thread=True)
+    await legacy.start()
+    await thread.start()
+
+    async def _discover(**kwargs: Any) -> list[lights_module.FoundLight]:
+        found = await asyncio.gather(
+            *(
+                lights_module.discover_lights(**kwargs, port=fake.port)
+                for fake in (bulb, legacy, thread)
+            )
+        )
+        return [light for lights in found for light in lights]
+
+    monkeypatch.setattr(setup_flow, "DISCOVERY_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(setup_flow, "discover_lights", _discover)
+    finish = AsyncMock(return_value={"instance_id": _INSTANCE_ID})
+    session = SetupSession(
+        MagicMock(),
+        "flow-3",
+        SetupFlowContext(kind="setup", reason="user", domain="lifx_entertainment"),
+        finish,
+    )
+    flow = asyncio.create_task(setup_flow.run_setup(session))
+    try:
+        await _wait_for(lambda: _form(session, "user"))
+        session.handle_submit({CONF_BROADCAST: "127.0.0.1"})
+        await _wait_for(lambda: _form(session, "select_lights"))
+        step = session.current_step
+        assert step is not None
+        lights = next(e for e in step.entries if e.key == CONF_LIGHTS)
+        assert lights.options is not None
+        options = {o.value: o for o in lights.options}
+        assert not options[bulb.serial].disabled
+        assert options[legacy.serial].disabled
+        assert options[legacy.serial].translation_key == "legacy_multizone"
+        assert options[thread.serial].disabled
+        assert options[thread.serial].translation_key == "thread"
+        assert lights.default_value == [bulb.serial]
+        # the server does not enforce disabled options
+        session.handle_submit({CONF_LIGHTS: [bulb.serial, legacy.serial, thread.serial]})
+        await asyncio.wait_for(flow, 5)
+    finally:
+        flow.cancel()
+        legacy.close()
+        thread.close()
+    assert finish.await_args is not None
+    devices = setup_flow.parse_devices(finish.await_args.args[1][CONF_DEVICES])
+    assert [d.serial for d in devices] == [bulb.serial]
+
+
+@pytest.mark.parametrize(
+    ("hosts", "valid"),
+    [
+        ("192.168.1.20", True),
+        ("2001:db8::20", True),
+        ("192.168.1.20, 2001:db8::21", True),
+        ("lamp.local", False),
+        ("192.168.1.300", False),
+    ],
+)
+async def test_setup_flow_checks_the_addresses(
+    monkeypatch: pytest.MonkeyPatch, hosts: str, valid: bool
+) -> None:
+    """IPv4 and IPv6 addresses reach the discovery; anything else is rejected first."""
+    discover = AsyncMock(return_value=[])
+    monkeypatch.setattr(setup_flow, "discover_lights", discover)
+    session = SetupSession(
+        MagicMock(),
+        "flow-4",
+        SetupFlowContext(kind="setup", reason="user", domain="lifx_entertainment"),
+        AsyncMock(),
+    )
+    flow = asyncio.create_task(setup_flow.run_setup(session))
+    try:
+        await _wait_for(lambda: _form(session, "user"))
+        session.handle_submit({CONF_EXTRA_HOSTS: hosts})
+        await _wait_for(
+            lambda: _form(session, "user") and bool(getattr(session.current_step, "errors", None))
+        )
+        assert session.current_step is not None
+        expected = "no_lights_found" if valid else "invalid_address"
+        assert session.current_step.errors == {"base": expected}
+    finally:
+        flow.cancel()
+    if valid:
+        assert discover.await_args is not None
+        assert discover.await_args.kwargs["hosts"] == setup_flow.parse_hosts(hosts)
+    else:
+        discover.assert_not_awaited()
+
+
+async def test_startup_skips_a_stored_legacy_strip(
+    monkeypatch: pytest.MonkeyPatch, sendspin_server: SendspinServer, bulb: FakeLifxDevice
+) -> None:
+    """A legacy strip stored before it was refused gets no player; the other lights do."""
+    monkeypatch.setattr(provider_module, "DISCOVERY_TIMEOUT_S", 0.3)
+    legacy = LifxDevice(
+        "d073d5cccccc",
+        "127.0.0.1",
+        label="Old strip",
+        group_id="22" * 16,
+        group_label="Kitchen",
+        zone_support=ZoneSupport.LEGACY,
+        zone_count=8,
+    )
+    setup_data = {
+        CONF_BROADCAST: "127.0.0.1",
+        CONF_DEVICES: json.dumps([_stored(bulb), legacy.to_dict()]),
+    }
+    config = await _make_config(setup_data)
+    provider = LifxEntertainmentProvider(
+        _make_mass(sendspin_server, setup_data), _manifest(), config, set()
+    )
+
+    await provider.handle_async_init()
+    try:
+        names = [c.name for c in sendspin_server.clients if c.client_id.startswith("lifx-")]
+        assert names == ["LIFX: Living room"]
+    finally:
+        await provider.unload()
+
+
+async def test_setup_fails_with_only_a_legacy_strip(sendspin_server: SendspinServer) -> None:
+    """A provider whose only light can't sync fails its setup."""
+    legacy = LifxDevice("d073d5cccccc", "127.0.0.1", zone_support=ZoneSupport.LEGACY, zone_count=8)
+    setup_data = {CONF_DEVICES: json.dumps([legacy.to_dict()])}
+    config = await _make_config(setup_data)
+    provider = LifxEntertainmentProvider(
+        _make_mass(sendspin_server, setup_data), _manifest(), config, set()
+    )
+
+    with pytest.raises(SetupFailedError):
+        await provider.handle_async_init()
+
+
+async def test_session_leaves_a_thread_light_alone(bulb: FakeLifxDevice) -> None:
+    """A Thread light in an area is refused at session start and never touched."""
+    from lifx.effects import DeviceStateManager  # noqa: PLC0415
+
+    from music_assistant.providers.lifx_entertainment.areas import build_areas  # noqa: PLC0415
+    from music_assistant.providers.lifx_entertainment.session import (  # noqa: PLC0415
+        EntertainmentSession,
+    )
+    from music_assistant.providers.sendspin_lights.models import LightColor  # noqa: PLC0415
+
+    thread = FakeLifxDevice("d073d5dddddd", "Thread bulb", power=0, thread=True)
+    await thread.start()
+    pool = lights_module.LightPool()
+    stored = [LifxDevice.from_dict(_stored(bulb)), LifxDevice.from_dict(_stored(thread))]
+    area = build_areas(stored, "all")[0]
+    session = EntertainmentSession(pool, DeviceStateManager(), area)
+    try:
+        await session.start()
+        assert session.is_streaming
+        session.send([LightColor(c.channel_id, red=65535) for c in area.channels])
+        await _wait_for(lambda: bool(bulb.of_type(packets.Light.SetColor)))
+        await session.aclose()
+    finally:
+        await pool.close()
+        thread.close()
+    assert thread.power == 0
+    touched = (packets.Light.SetColor, packets.Light.SetPower, packets.Device.SetPower)
+    assert not [p for _, p in thread.received if isinstance(p, touched)]

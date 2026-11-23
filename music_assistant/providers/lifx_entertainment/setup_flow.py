@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-from lifx_entertainment import LifxDevice, discover_devices
+from lifx import LifxError
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType
 
@@ -27,6 +27,8 @@ from .constants import (
     DISCOVERY_TIMEOUT_S,
     GROUPINGS,
 )
+from .lights import discover_lights, is_valid_address
+from .models import LifxDevice
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigValueType
@@ -68,9 +70,12 @@ async def run_setup(session: SetupSession) -> None:
         )
         broadcast_default = str(values.get(CONF_BROADCAST) or DEFAULT_BROADCAST).strip()
         hosts_default = str(values.get(CONF_EXTRA_HOSTS) or "").strip()
+        if not all(map(is_valid_address, [broadcast_default, *parse_hosts(hosts_default)])):
+            errors = {"base": "invalid_address"}
+            continue
         try:
-            devices = await session.progress_until(
-                discover_devices(
+            found = await session.progress_until(
+                discover_lights(
                     timeout=DISCOVERY_TIMEOUT_S,
                     broadcast=broadcast_default,
                     hosts=parse_hosts(hosts_default),
@@ -82,14 +87,15 @@ async def run_setup(session: SetupSession) -> None:
         except StepExpiredError, TimeoutError:
             errors = {"base": "no_lights_found"}
             continue
-        except OSError as err:
+        except (OSError, LifxError) as err:
             errors = {"base": str(err)}
             continue
-        if not devices:
+        if not found:
             errors = {"base": "no_lights_found"}
             continue
 
-        by_serial = {d.serial: d for d in devices}
+        # Lights that can't sync are listed too, greyed out with the reason.
+        by_serial = {f.device.serial: f.device for f in found if f.unsupported is None}
         selected_default = [s for s in by_serial if s in previous] or list(by_serial)
         selection = await session.form(
             [
@@ -100,7 +106,13 @@ async def run_setup(session: SetupSession) -> None:
                     default_value=selected_default,
                     value=selected_default,
                     options=[
-                        ConfigValueOption(title=_device_title(d), value=d.serial) for d in devices
+                        ConfigValueOption(
+                            title=_device_title(f.device),
+                            value=f.device.serial,
+                            disabled=f.unsupported is not None,
+                            translation_key=f.unsupported.value if f.unsupported else None,
+                        )
+                        for f in found
                     ],
                 ),
                 ConfigEntry(
@@ -113,10 +125,11 @@ async def run_setup(session: SetupSession) -> None:
             ],
             step_id="select_lights",
             last_step=True,
-            translation_params=[str(len(devices))],
+            translation_params=[str(len(found))],
         )
         chosen = selection.get(CONF_LIGHTS) or []
         serials = [str(s) for s in (chosen if isinstance(chosen, list) else [chosen])]
+        # The server does not enforce disabled options.
         picked = [by_serial[s] for s in serials if s in by_serial]
         if not picked:
             errors = {"base": "no_lights_selected"}
@@ -146,7 +159,7 @@ def parse_devices(raw: object) -> list[LifxDevice]:
 
 
 def parse_hosts(raw: object) -> list[str]:
-    """Parse a comma/space separated list of IP addresses."""
+    """Parse a comma/space separated list of IPv4 and IPv6 addresses."""
     if not raw:
         return []
     return [h for h in str(raw).replace(",", " ").split() if h]

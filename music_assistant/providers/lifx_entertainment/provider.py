@@ -8,20 +8,15 @@ import logging
 from contextlib import suppress
 from typing import TYPE_CHECKING, cast
 
-from lifx_entertainment import (
-    Grouping,
-    LifxDevice,
-    LifxLanAPI,
-    LifxTransport,
-    build_areas,
-    discover_devices,
-)
+from lifx import LifxError
+from lifx.effects import DeviceStateManager
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType
 from music_assistant_models.errors import SetupFailedError
 
 from music_assistant.models.plugin import PluginProvider
 
+from .areas import Grouping, build_areas
 from .bridge import LifxEntertainmentBridgeManager
 from .constants import (
     COLOR_MODES,
@@ -45,6 +40,8 @@ from .constants import (
     GROUPINGS,
     REDISCOVERY_INTERVAL_S,
 )
+from .lights import LightPool, locate_lights
+from .models import ZoneSupport
 from .settings import (
     get_brightness,
     get_color_mode,
@@ -61,6 +58,8 @@ if TYPE_CHECKING:
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.providers.sendspin.provider import SendspinProvider
+
+    from .models import LifxDevice
 
 LOGGER = logging.getLogger(__name__)
 
@@ -86,8 +85,10 @@ class LifxEntertainmentProvider(PluginProvider):
     ) -> None:
         """Initialize the provider."""
         super().__init__(mass, manifest, config, supported_features)
-        self._transport: LifxTransport | None = None
-        self._api: LifxLanAPI | None = None
+        self._pool: LightPool | None = None
+        # Shared by every session, so a restart right after a restore reads the state
+        # that was restored rather than a light still fading back to it.
+        self._state_manager = DeviceStateManager()
         self._devices: dict[str, LifxDevice] = {}
         self._bridge_manager: LifxEntertainmentBridgeManager | None = None
         self._rediscovery_task: asyncio.Task[None] | None = None
@@ -135,12 +136,17 @@ class LifxEntertainmentProvider(PluginProvider):
         )
 
     @property
-    def lifx_api(self) -> LifxLanAPI | None:
-        """Return the LIFX LAN API client."""
-        return self._api
+    def light_pool(self) -> LightPool | None:
+        """Return the connections to the lights, while the provider is loaded."""
+        return self._pool
+
+    @property
+    def state_manager(self) -> DeviceStateManager:
+        """Return the manager that captures and restores the lights' state."""
+        return self._state_manager
 
     async def handle_async_init(self) -> None:
-        """Open the LAN transport, refresh the devices and set up a bridge per area."""
+        """Follow the lights' addresses and set up a bridge per area."""
         # Reset a color mode that no longer exists, so the dropdown shows a valid option.
         stored_mode = self.config.get_value(CONF_COLOR_MODE)
         if stored_mode is not None and str(stored_mode) not in COLOR_MODES:
@@ -150,31 +156,42 @@ class LifxEntertainmentProvider(PluginProvider):
         if not stored:
             raise SetupFailedError("No LIFX lights configured")
         self._devices = {d.serial: d for d in stored}
+        supported = []
+        for device in stored:
+            if device.zone_support == ZoneSupport.LEGACY:
+                self.logger.warning(
+                    "LIFX strip '%s' has no extended multizone support and can't sync to "
+                    "music; update its firmware in the LIFX app",
+                    device.label or device.serial,
+                )
+                continue
+            supported.append(device)
+        if not supported:
+            raise SetupFailedError("None of the configured LIFX lights can sync to music")
         sendspin_provider = cast("SendspinProvider | None", self.mass.get_provider("sendspin"))
         if sendspin_provider is None:
             raise SetupFailedError("The Sendspin provider is not available")
 
         try:
-            self._transport = LifxTransport()
-            await self._transport.open()
-            self._api = LifxLanAPI(self._transport)
-            await self._rediscover()
+            self._pool = LightPool()
+            try:
+                await self._rediscover()
+            except (LifxError, OSError, ValueError) as err:
+                # The stored addresses still work; the next rediscovery tries again.
+                self.logger.warning("LIFX discovery failed: %s", err)
             self._bridge_manager = LifxEntertainmentBridgeManager(self)
             grouping = str(self.get_setup_value(CONF_GROUPING) or DEFAULT_GROUPING)
             if grouping not in GROUPINGS:
                 grouping = DEFAULT_GROUPING
-            areas = build_areas(list(self._devices.values()), Grouping(grouping))
+            areas = build_areas(supported, Grouping(grouping))
             self.logger.info(
                 "Found %d LIFX light player(s): %s",
                 len(areas),
                 ", ".join(f"{a.name} ({len(a.devices)} lights)" for a in areas),
             )
             await self._bridge_manager.setup_bridges(sendspin_provider, areas)
-        except OSError as err:
-            # unload() is not called for a provider whose setup failed: clean up here.
-            await self.unload()
-            raise SetupFailedError(f"Failed to open the LIFX LAN connection: {err}") from err
         except BaseException:
+            # unload() is not called for a provider whose setup failed: clean up here.
             await self.unload()
             raise
         self._rediscovery_task = self.mass.create_task(self._rediscovery_loop())
@@ -189,10 +206,9 @@ class LifxEntertainmentProvider(PluginProvider):
         if self._bridge_manager:
             await self._bridge_manager.stop_all()
             self._bridge_manager = None
-        if self._transport:
-            self._transport.close()
-            self._transport = None
-        self._api = None
+        if self._pool:
+            await self._pool.close()
+            self._pool = None
 
     async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
         """Apply playback settings in place; reload for anything else."""
@@ -220,40 +236,25 @@ class LifxEntertainmentProvider(PluginProvider):
                 self.logger.debug("LIFX rediscovery failed: %s", err)
 
     async def _rediscover(self) -> None:
-        """Update the configured devices in place, so running sessions follow IP changes."""
-        if self._transport is None:
+        """Update the stored lights' addresses in place, so running sessions follow them."""
+        if self._pool is None:
             return
         broadcast = str(self.get_setup_value(CONF_BROADCAST) or DEFAULT_BROADCAST)
         hosts = parse_hosts(self.get_setup_value(CONF_EXTRA_HOSTS))
         # Probe the last known addresses too, in case broadcasts don't reach this host.
         hosts += [d.host for d in self._devices.values() if d.host not in hosts]
-        found = await discover_devices(
-            self._transport, timeout=DISCOVERY_TIMEOUT_S, broadcast=broadcast, hosts=hosts
-        )
+        found = await locate_lights(timeout=DISCOVERY_TIMEOUT_S, broadcast=broadcast, hosts=hosts)
         changed = False
-        for device in found:
-            current = self._devices.get(device.serial)
+        for located in found:
+            current = self._devices.get(located.serial)
             if current is None:
                 continue
-            if current.host != device.host or current.port != device.port:
+            if current.host != located.ip or current.port != located.port:
                 self.logger.info(
-                    "LIFX light '%s' moved from %s to %s", current.label, current.host, device.host
+                    "LIFX light '%s' moved from %s to %s", current.label, current.host, located.ip
                 )
-                current.host, current.port = device.host, device.port
-                changed = True
-            if device.label:
-                current.label = device.label
-            # Zones define the bridges' channels, so only refresh them before the bridges
-            # exist. A failed probe reads as "no zones", so only trust a positive one.
-            if (
-                self._bridge_manager is None
-                and device.is_multizone
-                and (
-                    (current.zone_support, current.zone_count)
-                    != (device.zone_support, device.zone_count)
-                )
-            ):
-                current.zone_support, current.zone_count = device.zone_support, device.zone_count
+                current.host, current.port = located.ip, located.port
+                self._pool.follow(current.serial, current.host, current.port)
                 changed = True
         missing = set(self._devices) - {d.serial for d in found}
         if missing:

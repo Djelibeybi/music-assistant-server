@@ -6,7 +6,7 @@
   "description": "Sync LIFX lights to music over the LAN protocol.",
   "codeowners": ["@sonic1200"],
   "depends_on": "sendspin",
-  "requirements": ["lifx-entertainment==0.1.0"],
+  "requirements": ["lifx-async==8.0.2"],
   "documentation": "https://music-assistant.io/plugins/lifx-entertainment/",
   "multi_instance": true,
   "builtin": false,

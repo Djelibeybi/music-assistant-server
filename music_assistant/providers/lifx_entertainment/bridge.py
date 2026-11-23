@@ -9,17 +9,18 @@ from typing import TYPE_CHECKING
 
 from aiosendspin.models.types import UndefinedField
 from aiosendspin.models.visualizer import ClientHelloVisualizerSpectrum, VisualizerStatePayload
-from lifx_entertainment import EntertainmentSession, LightColorCommand, area_client_id
 
 from music_assistant.providers.sendspin_lights.analyzer import AudioAnalyzer
 from music_assistant.providers.sendspin_lights.base import SendspinLightBridge
 
+from .areas import area_client_id
 from .constants import (
     SPECTRUM_BINS,
     SPECTRUM_F_MAX,
     SPECTRUM_F_MIN,
     SPECTRUM_SCALE,
 )
+from .session import EntertainmentSession
 from .settings import (
     get_brightness,
     get_color_mode,
@@ -32,10 +33,10 @@ if TYPE_CHECKING:
     from aiosendspin.models.core import ServerStatePayload
     from aiosendspin.models.visualizer import BeatTiming
     from aiosendspin.server.roles.visualizer.features import ExtractedFrame
-    from lifx_entertainment import EntertainmentArea
 
     from music_assistant.providers.sendspin.provider import SendspinProvider
 
+    from .models import EntertainmentArea
     from .provider import LifxEntertainmentProvider
 
 LOGGER = logging.getLogger(__name__)
@@ -162,11 +163,15 @@ class LifxEntertainmentBridge(SendspinLightBridge):
 
     async def _start_session_locked(self) -> None:
         """Start a session; the caller holds the session lock."""
-        api = self.lifx_provider.lifx_api
-        if api is None:
+        pool = self.lifx_provider.light_pool
+        if pool is None:
             return
         session = EntertainmentSession(
-            api, self.area, transition_ms=self._transition_ms, power_on=self._power_on
+            pool,
+            self.lifx_provider.state_manager,
+            self.area,
+            transition_ms=self._transition_ms,
+            power_on=self._power_on,
         )
         # Until adopted, the finally closes the session so a failed or cancelled start
         # never leaves the lights half switched on.
@@ -285,7 +290,7 @@ class LifxEntertainmentBridge(SendspinLightBridge):
         # Render ahead of the playhead to compensate for Wi-Fi + bulb lag.
         colors = self._analyzer.render(self.sendspin_server.clock.now_us() + self._latency_us)
         if colors:
-            session.send([LightColorCommand(c.channel_id, c.red, c.green, c.blue) for c in colors])
+            session.send(colors)
 
     @staticmethod
     async def _cancel_task(task: asyncio.Task[None] | None) -> None:
