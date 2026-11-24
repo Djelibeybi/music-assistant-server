@@ -203,8 +203,7 @@ async def _sweep_all(
 async def _describe(discovered: DiscoveredDevice) -> FoundLight | None:
     """Read a light's label, group, product and zones, and whether it can be synced."""
     # None for a device that didn't answer or isn't a light (a relay or a button).
-    # Typed in lifx-async once https://github.com/Djelibeybi/lifx-async/issues/355 ships.
-    light = await discovered.create_device()  # type: ignore[no-untyped-call]
+    light = await discovered.create_device()
     if light is None:
         return None
     try:
