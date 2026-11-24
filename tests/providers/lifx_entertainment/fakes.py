@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from lifx.protocol import packets
 from lifx.protocol.header import LifxHeader
 from lifx.protocol.packets import get_packet_class
 from lifx.protocol.protocol_types import DeviceService, LightHsbk
+
+if TYPE_CHECKING:
+    from lifx.protocol.base import Packet
 
 # A bulb, and a strip whose extended multizone support depends on its firmware (2.77+).
 BULB_PRODUCT = 27
@@ -105,11 +109,11 @@ class FakeLifxDevice(asyncio.DatagramProtocol):
         if reply is not None and (header.res_required or packet_class.PKT_TYPE == 2):
             self._reply(header, addr, reply)
 
-    def _reply(self, header: LifxHeader, addr: tuple[str | int, int], packet: object) -> None:
+    def _reply(self, header: LifxHeader, addr: tuple[str | int, int], packet: Packet) -> None:
         assert self._transport is not None
-        payload = packet.pack()  # type: ignore[attr-defined]
+        payload = packet.pack()
         reply = LifxHeader.create(
-            pkt_type=packet.PKT_TYPE,  # type: ignore[attr-defined]
+            pkt_type=packet.PKT_TYPE,
             source=header.source,
             target=bytes.fromhex(self.serial),
             res_required=False,
@@ -119,8 +123,7 @@ class FakeLifxDevice(asyncio.DatagramProtocol):
         reply.thread_connection = self.thread
         self._transport.sendto(reply.pack() + payload, (str(addr[0]), int(addr[1])))
 
-    def _handle(self, packet: object) -> object | None:
-        label = self.label.encode().ljust(32, b"\x00")
+    def _handle(self, packet: Packet) -> Packet | None:
         match packet:
             case packets.Device.GetService():
                 return packets.Device.StateService(service=DeviceService.UDP, port=self.port)
@@ -133,10 +136,11 @@ class FakeLifxDevice(asyncio.DatagramProtocol):
                     build=0, version_minor=minor, version_major=major
                 )
             case packets.Device.GetLabel():
-                return packets.Device.StateLabel(label=label)
+                return packets.Device.StateLabel(label=self.label)
             case packets.Device.GetGroup():
-                group = self.group.encode().ljust(32, b"\x00")
-                return packets.Device.StateGroup(group=self.group_id, label=group, updated_at=0)
+                return packets.Device.StateGroup(
+                    group=self.group_id, label=self.group, updated_at=0
+                )
             case packets.Device.GetPower() | packets.Light.GetPower():
                 return packets.Light.StatePower(level=self.power)
             case packets.Device.SetPower(level=level) | packets.Light.SetPower(level=level):
@@ -144,7 +148,7 @@ class FakeLifxDevice(asyncio.DatagramProtocol):
                 return packets.Light.StatePower(level=self.power)
             case packets.Light.GetColor():
                 return packets.Light.StateColor(
-                    color=self.color.packed(), power=self.power, label=label
+                    color=self.color.packed(), power=self.power, label=self.label
                 )
             case packets.Light.SetColor(color=color):
                 self.color = Hsbk.of(color)
@@ -152,11 +156,9 @@ class FakeLifxDevice(asyncio.DatagramProtocol):
                 return None
         return self._handle_zones(packet)
 
-    def _handle_zones(self, packet: object) -> object | None:
+    def _handle_zones(self, packet: Packet) -> Packet | None:
         if not self.zone_count:
-            return packets.Device.StateUnhandled(
-                unhandled_type=packet.PKT_TYPE  # type: ignore[attr-defined]
-            )
+            return packets.Device.StateUnhandled(unhandled_type=packet.PKT_TYPE)
         match packet:
             case packets.MultiZone.GetColorZones(start_index=start):
                 window = (self.zones[start:] + [self.color] * 8)[:8]
